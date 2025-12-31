@@ -1,0 +1,303 @@
+name: Cleanup Workflow Runs
+on:
+  schedule:
+    - cron: '0 0 * * 0' # 每周日0点运行
+  workflow_dispatch:
+    inputs:
+      keep_days:
+        description: "保留最近多少天（0=全部清理，默认0）"
+        required: false
+        default: "0"
+      repositories:
+        description: "要清理的仓库（格式：owner/repo，多个用逗号分隔，留空为当前仓库，输入 'all' 清理所有仓库）"
+        required: false
+        default: ""
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: 设置目标仓库列表
+        id: set-repos
+        run: |
+          if [ -z "${{ github.event.inputs.repositories }}" ]; then
+            REPOS="${{ github.repository }}"
+            MODE="current"
+          elif [ "${{ github.event.inputs.repositories }}" = "all" ]; then
+            REPOS="all"
+            MODE="all"
+          else
+            REPOS="${{ github.event.inputs.repositories }}"
+            MODE="manual"
+          fi
+        
+          REPOS=$(echo "$REPOS" | tr -d ' ' | sed 's/,,*/,/g' | sed 's/^,//' | sed 's/,$//')
+        
+          echo "repositories=$REPOS" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "🔍 模式：$MODE，将清理仓库：$REPOS"
+
+      - name: 获取所有仓库列表（如果是all模式）
+        if: steps.set-repos.outputs.mode == 'all'
+        id: get-all-repos
+        run: |
+          echo "🔍 正在获取您有权限的所有仓库..."
+         
+          page=1
+          ALL_REPOS=""
+         
+          while true; do
+            RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.AUTH_PAT }}" \
+                          "https://api.github.com/user/repos?per_page=100&page=$page&affiliation=owner,collaborator,organization_member&sort=full_name")
+           
+            REPOS_PAGE=$(echo "$RESPONSE" | jq -r '.[].full_name' | tr '\n' ',')
+           
+            if [ -z "$REPOS_PAGE" ] || [ "$REPOS_PAGE" = "" ]; then
+              break
+            fi
+           
+            ALL_REPOS="${ALL_REPOS}${REPOS_PAGE}"
+            page=$((page + 1))
+           
+            TOTAL_PROCESSED=$(( (page-1) * 100 ))
+            echo "📊 已获取 $TOTAL_PROCESSED 个仓库..."
+           
+            if [ $page -gt 20 ]; then
+              echo "⚠️ 注意：已获取 2000 个仓库，如需更多请调整 page 限制"
+              break
+            fi
+           
+            sleep 0.5
+          done
+         
+          ALL_REPOS=${ALL_REPOS%,}
+          REPO_COUNT=$(echo "$ALL_REPOS" | tr ',' '\n' | wc -l)
+         
+          echo "repositories=$ALL_REPOS" >> $GITHUB_OUTPUT
+          echo "🔍 共找到 $REPO_COUNT 个仓库"
+
+      - name: 过滤有workflow文件的仓库（安全版）
+        if: steps.set-repos.outputs.mode == 'all'
+        id: filter-workflow-repos
+        run: |
+          echo "🔍 过滤有 .github/workflows/ 文件的仓库（安全版）..."
+         
+          # 初始化变量
+          IFS=',' read -ra ALL_REPOS <<< "${{ steps.get-all-repos.outputs.repositories }}"
+          ACTIVE_REPOS=""
+          CHECKED_COUNT=0
+          TOTAL_TO_CHECK=${#ALL_REPOS[@]}
+         
+          echo "📊 总共需要检查 $TOTAL_TO_CHECK 个仓库"
+         
+          # 设置错误处理 - 即使单个仓库检查失败，也不退出整个脚本
+          set +e
+          trap 'echo "处理仓库时发生错误，继续下一个..."' ERR
+         
+          for REPO in "${ALL_REPOS[@]}"; do
+            ((CHECKED_COUNT++))
+           
+            if (( CHECKED_COUNT % 10 == 0 )); then
+              echo "📊 正在检查仓库 $CHECKED_COUNT/$TOTAL_TO_CHECK..."
+            fi
+           
+            HAS_WORKFLOW=0
+           
+            # 简化检查逻辑 - 直接检查是否有workflows目录，不关心具体分支
+            WORKFLOWS_RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.AUTH_PAT }}" \
+                              "https://api.github.com/repos/$REPO/contents/.github/workflows")
+           
+            # 检查响应是否是数组（目录有内容）或对象（空目录）
+            if echo "$WORKFLOWS_RESPONSE" | jq -e '.type == "dir" or type == "array"' >/dev/null 2>&1; then
+              HAS_WORKFLOW=1
+            else
+              # 如果主分支没有，尝试常见分支
+              for BRANCH in main master; do
+                WORKFLOWS_RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.AUTH_PAT }}" \
+                                  "https://api.github.com/repos/$REPO/contents/.github/workflows?ref=$BRANCH" 2>/dev/null || echo "{}")
+               
+                if echo "$WORKFLOWS_RESPONSE" | jq -e '.type == "dir" or type == "array"' >/dev/null 2>&1; then
+                  HAS_WORKFLOW=1
+                  break
+                fi
+              done
+            fi
+           
+            if [ "$HAS_WORKFLOW" -eq 1 ]; then
+              ACTIVE_REPOS="${ACTIVE_REPOS}${REPO},"
+              echo " ✅ $REPO 有 workflow 文件"
+            else
+              echo " ⏭️ $REPO 无 workflow 文件，跳过"
+            fi
+           
+            sleep 0.2
+          done
+         
+          # 恢复错误处理
+          set -e
+          trap - ERR
+         
+          ACTIVE_REPOS=${ACTIVE_REPOS%,}
+          ACTIVE_COUNT=0
+          if [ -n "$ACTIVE_REPOS" ]; then
+            ACTIVE_COUNT=$(echo "$ACTIVE_REPOS" | tr ',' '\n' | wc -l)
+          fi
+         
+          echo "📊 在 $CHECKED_COUNT 个仓库中，$ACTIVE_COUNT 个包含 workflow 文件"
+         
+          if [ -n "$ACTIVE_REPOS" ] && [ "$ACTIVE_COUNT" -gt 0 ]; then
+            echo "使用过滤后的仓库列表（有workflow文件的）"
+            echo "repositories=$ACTIVE_REPOS" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ 过滤后没有发现包含workflow文件的仓库，使用原始列表"
+            echo "repositories=${{ steps.get-all-repos.outputs.repositories }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 清理工作流运行
+        env:
+          KEEP_DAYS: ${{ github.event.inputs.keep_days }}
+          REPOSITORIES: ${{ steps.set-repos.outputs.mode == 'all' && (steps.filter-workflow-repos.outputs.repositories || steps.get-all-repos.outputs.repositories) || steps.set-repos.outputs.repositories }}
+          GH_TOKEN: ${{ secrets.AUTH_PAT }}
+        run: |
+          : "${KEEP_DAYS:=0}"
+        
+          echo "参数配置："
+          echo " - 保留天数: $KEEP_DAYS (0=全部清理)"
+          echo " - 目标仓库数量: $(echo "$REPOSITORIES" | tr ',' '\n' | wc -l) 个"
+        
+          if [ -z "$REPOSITORIES" ]; then
+            echo "❌ 错误：未指定要清理的仓库"
+            exit 1
+          fi
+        
+          IFS=',' read -ra REPO_ARRAY <<< "$REPOSITORIES"
+        
+          BATCH_SIZE=10
+          TOTAL_REPOS=${#REPO_ARRAY[@]}
+          CURRENT_INDEX=0
+        
+          for TARGET_REPO in "${REPO_ARRAY[@]}"; do
+            CURRENT_INDEX=$((CURRENT_INDEX + 1))
+           
+            if (( CURRENT_INDEX % BATCH_SIZE == 0 )) || (( CURRENT_INDEX == TOTAL_REPOS )); then
+              echo ""
+              echo "📈 进度: $CURRENT_INDEX/$TOTAL_REPOS 个仓库"
+            fi
+           
+            echo ""
+            echo "========================================"
+            echo "🎯 开始清理仓库 ($CURRENT_INDEX/$TOTAL_REPOS): $TARGET_REPO"
+            echo "========================================"
+          
+            JQ_FILTER='.workflow_runs[] | select(.status=="completed")'
+          
+            if [ "$KEEP_DAYS" -gt 0 ]; then
+              THRESHOLD=$(date -u -d "${KEEP_DAYS} days ago" '+%Y-%m-%dT%H:%M:%SZ')
+              echo "📅 保留最近 $KEEP_DAYS 天的运行记录"
+              echo "⏰ 阈值时间(UTC)：$THRESHOLD"
+              JQ_FILTER="$JQ_FILTER | select(.created_at < \"$THRESHOLD\")"
+            else
+              echo "⚠️ 警告：将清理所有已完成的工作流运行"
+            fi
+          
+            TOTAL_DELETED=0
+            TOTAL_FAILED=0
+            page=1
+          
+            while true; do
+              echo "📄 正在获取第 $page 页..."
+            
+              RESPONSE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                            "https://api.github.com/repos/$TARGET_REPO/actions/runs?per_page=100&page=$page")
+            
+              if ! echo "$RESPONSE" | jq -e '.workflow_runs' > /dev/null 2>&1; then
+                ERROR_MSG=$(echo "$RESPONSE" | jq -r '.message // "未知错误"')
+                if [ "$ERROR_MSG" = "Bad credentials" ]; then
+                  echo "❌ 身份验证失败，请检查 AUTH_PAT 是否有效"
+                  break
+                elif [ "$ERROR_MSG" = "Not Found" ]; then
+                  echo "❌ 仓库 '$TARGET_REPO' 不存在或无权访问"
+                  break
+                else
+                  echo "❌ API 响应异常：$ERROR_MSG"
+                  break
+                fi
+              fi
+            
+              RUN_IDS=$(echo "$RESPONSE" | jq -r "$JQ_FILTER | .id" | tr '\n' ' ')
+            
+              if [ -z "$RUN_IDS" ] || [ "$RUN_IDS" = " " ]; then
+                echo "✅ 第 $page 页没有可删除的运行"
+                TOTAL_COUNT=$(echo "$RESPONSE" | jq '.total_count // 0')
+                TOTAL_PROCESSED=$(( (page-1) * 100 ))
+                if [ $TOTAL_PROCESSED -ge $TOTAL_COUNT ]; then
+                  echo "📊 已处理完所有 $TOTAL_COUNT 个记录"
+                  break
+                fi
+              else
+                RUN_IDS=$(echo "$RUN_IDS" | xargs)
+                COUNT=$(echo "$RUN_IDS" | wc -w)
+                echo "🗑️ 第 $page 页发现 $COUNT 个待删除运行"
+              
+                for RUN_ID in $RUN_IDS; do
+                  echo " 删除运行 ID: $RUN_ID"
+                
+                  DELETE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+                    -H "Authorization: token $GH_TOKEN" \
+                    "https://api.github.com/repos/$TARGET_REPO/actions/runs/$RUN_ID")
+                
+                  if [ "$DELETE_RESPONSE" = "204" ]; then
+                    echo " ✅ 删除成功"
+                    TOTAL_DELETED=$((TOTAL_DELETED + 1))
+                  else
+                    echo " ❌ 删除失败 (HTTP $DELETE_RESPONSE)"
+                    TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                  fi
+                
+                  sleep 0.2
+                done
+              
+                echo "📊 第 $page 页完成"
+              fi
+            
+              page=$((page + 1))
+            done
+          
+            echo ""
+            echo "✅ 仓库 $TARGET_REPO 清理完成"
+            echo "📈 统计：成功删除 $TOTAL_DELETED 个运行，失败 $TOTAL_FAILED 个"
+            echo ""
+          done
+        
+          echo "🎉 所有指定仓库清理完成！"
+          echo ""
+          echo "📋 最终统计："
+          echo " 总共处理仓库数: $TOTAL_REPOS"
+          echo " 模式: ${{ steps.set-repos.outputs.mode }}"
+
+# ========================================
+# 配置说明：
+# 1. 创建 Personal Access Token (PAT)：
+#    - 访问 GitHub → Settings → Developer settings → Personal access tokens
+#    - 生成 token，至少选择权限：repo (完全访问仓库)、workflow (读写工作流)
+#    
+# 2. 将 PAT 添加到仓库 Secrets：
+#    - 进入仓库 → Settings → Secrets and variables → Actions
+#    - 新建 Secret，名称：AUTH_PAT，值：粘贴刚才复制的 token
+#    
+# 3. 使用说明：
+#    - 定时任务：每周日0点自动运行，默认清理所有已完成运行
+#    - 手动触发：可指定保留天数(0=全部清理)和仓库列表(逗号分隔)
+#    - 示例：repositories: user/repo1,user/repo2，keep_days: 7
+#    - all = 自动获取并清理所有有权限的仓库（推荐用于批量管理）
+#
+# 4. 使用 AUTH_PAT - 可以直接复制到任何仓库
+#    secrets.AUTH_PAT
+#    使用 GITHUB_TOKEN - 仅限当前仓库，无跨项目权限，是 GitHub Actions 运行时自动生成的临时 token
+#    secrets.GITHUB_TOKEN
+# ========================================
